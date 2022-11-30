@@ -1,0 +1,142 @@
+#include <clock.hfa>
+#include <kernel.hfa>
+#include <locale.h>
+#include <parseargs.hfa>
+#include <stdio.h>
+#include <stdlib.hfa>
+#include <stats.hfa>
+#include <thread.hfa>
+#include <time.hfa>
+#include <unistd.h>
+
+volatile bool stop = false;
+bool clock_mode;
+double duration = -1;
+unsigned long long stop_count = 0;
+unsigned nprocs = 1;
+unsigned nthreads = 1;
+
+volatile unsigned long long threads_left;
+
+#define thread_loop for(this.count = 0;; this.count++)
+
+#define BENCH_OPT \
+	{'d', "duration",  "Duration of the experiments in seconds", duration }, \
+	{'i', "iterations",  "Number of iterations of the experiments", stop_count }, \
+	{'t', "nthreads",  "Number of threads to use", nthreads }, \
+	{'p', "nprocs",    "Number of processors to use", nprocs }
+
+#define BENCH_OPT_PARSE(name) \
+	{ \
+		int opt_cnt = sizeof(opt) / sizeof(cfa_option); \
+		char **left; \
+		parse_args( argc, argv, opt, opt_cnt, "[OPTIONS]...\n" name, left ); \
+		if(duration > 0 && stop_count > 0) { \
+			fprintf(stderr, "--duration and --iterations cannot be used together\n"); \
+			print_args_usage(argc, argv, opt, opt_cnt, "[OPTIONS]...\n" name, true); \
+		} else if(duration > 0) { \
+			clock_mode = true; \
+			stop_count = 0xFFFFFFFFFFFFFFFF; \
+			printf("Running for %lf seconds\n", duration); \
+		} else if(stop_count > 0) { \
+			clock_mode = false; \
+			printf("Running for %llu iterations\n", stop_count); \
+		} else { \
+			duration = 5; clock_mode = true;\
+			printf("Running for %lf seconds\n", duration); \
+		} \
+	}
+
+struct cluster & bench_cluster;
+
+struct BenchCluster {
+	cluster cl;
+	processor * procs;
+	unsigned nprocs;
+};
+
+void ?{}( BenchCluster & this, unsigned nprocs ) {
+	(this.cl){ "Benchmark Cluster" };
+	&bench_cluster = &this.cl;
+	this.nprocs = nprocs;
+	this.procs  = alloc( this.nprocs );
+	for(i; this.nprocs){
+		processor * p = &this.procs[i];
+		(*p){ "Benchmark Processor", this.cl };
+	}
+	#if !defined(__CFA_NO_STATISTICS__)
+		print_stats_at_exit( this.cl, CFA_STATS_READY_Q );
+	#endif
+}
+
+void ^?{}( BenchCluster & this ) {
+	adelete( this.procs );
+	^(this.cl){};
+}
+
+void wait(const Time & start, bool is_tty) {
+	for() {
+		sleep(100`ms);
+		Time end = timeHiRes();
+		Duration delta = end - start;
+		if(is_tty) {
+			printf(" %.1f\r", delta`ds);
+			fflush(stdout);
+		}
+		if( clock_mode && delta >= duration`s ) {
+			break;
+		}
+		else if( !clock_mode && threads_left == 0 ) {
+			break;
+		}
+	}
+}
+
+struct __attribute__((aligned(128))) bench_sem {
+	struct thread$ * volatile ptr;
+};
+
+static inline {
+	void  ?{}(bench_sem & this) {
+		this.ptr = 0p;
+	}
+
+	void ^?{}(bench_sem & this) {}
+
+	bool wait(bench_sem & this) {
+		for() {
+			struct thread$ * expected = this.ptr;
+			if(expected == 1p) {
+				if(__atomic_compare_exchange_n(&this.ptr, &expected, 0p, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					return false;
+				}
+			}
+			else {
+				/* paranoid */ verify( expected == 0p );
+				if(__atomic_compare_exchange_n(&this.ptr, &expected, active_thread(), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					park();
+					return true;
+				}
+			}
+
+		}
+	}
+
+	bool post(bench_sem & this) {
+		for() {
+			struct thread$ * expected = this.ptr;
+			if(expected == 1p) return false;
+			if(expected == 0p) {
+				if(__atomic_compare_exchange_n(&this.ptr, &expected, 1p, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					return false;
+				}
+			}
+			else {
+				if(__atomic_compare_exchange_n(&this.ptr, &expected, 0p, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					unpark( expected );
+					return true;
+				}
+			}
+		}
+	}
+}

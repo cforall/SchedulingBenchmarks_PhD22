@@ -1,0 +1,75 @@
+#include "rq_bench.hfa"
+
+thread __attribute__((aligned(128))) Yielder {
+	unsigned long long count;
+};
+void ?{}( Yielder & this ) {
+	((thread&)this){ "Yielder Thread", bench_cluster };
+	this.count = 0;
+}
+
+void main( Yielder & this ) {
+	park();
+	for() {
+		yield();
+		this.count++;
+		if( clock_mode && stop) break;
+		if(!clock_mode && this.count >= stop_count) break;
+	}
+
+	__atomic_fetch_add(&threads_left, -1, __ATOMIC_SEQ_CST);
+}
+
+int main(int argc, char * argv[]) {
+	cfa_option opt[] = {
+		BENCH_OPT
+	};
+	BENCH_OPT_PARSE("cforall yield benchmark");
+
+	{
+		unsigned long long global_counter = 0;
+
+		Time start, end;
+		BenchCluster bc = { nprocs };
+		{
+			threads_left = nthreads;
+			Yielder * threads = alloc(nthreads);
+			for(i; nthreads) {
+				(threads[i]){};
+			}
+
+			printf("Starting\n");
+
+			bool is_tty = isatty(STDOUT_FILENO);
+			start = timeHiRes();
+
+			for(i; nthreads) {
+				unpark( threads[i] );
+			}
+			wait(start, is_tty);
+
+			stop = true;
+			end = timeHiRes();
+			printf("\nDone\n");
+
+			for(i; nthreads) {
+				Yielder & y = join( threads[i] );
+				global_counter += y.count;
+				^(threads[i]){};
+			}
+			free(threads);
+		}
+
+		printf("Duration (ms)        : %'ld\n", (end - start)`dms);
+		printf("Number of processors : %'d\n", nprocs);
+		printf("Number of threads    : %'d\n", nthreads);
+		printf("Total Operations(ops): %'15llu\n", global_counter);
+		printf("Ops per second       : %'18.2lf\n", ((double)global_counter) / (end - start)`s);
+		printf("ns per ops           : %'18.2lf\n", (end - start)`dns / global_counter);
+		printf("Ops per threads      : %'15llu\n", global_counter / nthreads);
+		printf("Ops per procs        : %'15llu\n", global_counter / nprocs);
+		printf("Ops/sec/procs        : %'18.2lf\n", (((double)global_counter) / nprocs) / (end - start)`s);
+		printf("ns per ops/procs     : %'18.2lf\n", (end - start)`dns / (global_counter / nprocs));
+		fflush(stdout);
+	}
+}

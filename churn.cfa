@@ -1,0 +1,111 @@
+#include "rq_bench.hfa"
+
+#include <locks.hfa>
+
+unsigned spot_cnt = 2;
+semaphore * spots;
+
+thread BThrd {
+	unsigned long long count;
+	unsigned long long blocks;
+	bool skip;
+};
+
+void ?{}( BThrd & this ) {
+	((thread&)this){ bench_cluster };
+	this.count  = 0;
+	this.blocks = 0;
+	this.skip = false;
+}
+
+void ^?{}( BThrd & mutex this ) {}
+
+void main( BThrd & this ) with( this ) {
+	park();
+	for() {
+		uint32_t r = prng(this);
+		semaphore & sem = spots[r % spot_cnt];
+		if(!skip) V( sem );
+		blocks += P( sem );
+		skip = false;
+
+		count ++;
+		if( clock_mode && stop) break;
+		if(!clock_mode && count >= stop_count) break;
+	}
+
+	__atomic_fetch_add(&threads_left, -1, __ATOMIC_SEQ_CST);
+}
+
+
+int main(int argc, char * argv[]) {
+	cfa_option opt[] = {
+		BENCH_OPT,
+		{ 's', "spots", "Number of spots in the system", spot_cnt }
+	};
+	BENCH_OPT_PARSE("cforall churn benchmark");
+
+	{
+		unsigned long long global_counter = 0;
+		unsigned long long global_blocks  = 0;
+		Time start, end;
+		BenchCluster bc = { nprocs };
+		{
+			spots = aalloc(spot_cnt);
+			for(i; spot_cnt) {
+				(spots[i]){ 0 };
+			}
+
+			threads_left = nthreads;
+			BThrd ** threads = alloc(nthreads);
+			for(i; nthreads ) {
+				BThrd & t = *(threads[i] = malloc());
+				(t){};
+				t.skip = i < spot_cnt;
+			}
+			printf("Starting\n");
+
+			bool is_tty = isatty(STDOUT_FILENO);
+			start = timeHiRes();
+
+			for(i; nthreads) {
+				unpark( *threads[i] );
+			}
+			wait(start, is_tty);
+
+			stop = true;
+			end = timeHiRes();
+			printf("\nDone\n");
+
+			for(i; spot_cnt) {
+				for(10000) V( spots[i] );
+			}
+
+			for(i; nthreads) {
+				BThrd & thrd = join( *threads[i] );
+				global_counter += thrd.count;
+				global_blocks  += thrd.blocks;
+				delete(threads[i]);
+			}
+
+			free(spots);
+			free(threads);
+		}
+
+		printf("Duration (ms)        : %'lf\n", (end - start)`dms);
+		printf("Number of processors : %'d\n", nprocs);
+		printf("Number of threads    : %'d\n", nthreads);
+		printf("Number of spots      : %'d\n", spot_cnt);
+		printf("Total Operations(ops): %'15llu\n", global_counter);
+		printf("Total blocks         : %'15llu\n", global_blocks);
+		printf("Ops per second       : %'18.2lf\n", ((double)global_counter) / (end - start)`ds);
+		printf("ns per ops           : %'18.2lf\n", (end - start)`dns / global_counter);
+		printf("Ops per threads      : %'15llu\n", global_counter / nthreads);
+		printf("Ops per procs        : %'15llu\n", global_counter / nprocs);
+		printf("Ops/sec/procs        : %'18.2lf\n", (((double)global_counter) / nprocs) / (end - start)`ds);
+		printf("ns per ops/procs     : %'18.2lf\n", (end - start)`dns / (global_counter / nprocs));
+		fflush(stdout);
+	}
+
+	return 0;
+}

@@ -1,0 +1,106 @@
+#include "rq_bench.hfa"
+
+struct Partner {
+	unsigned long long count;
+	unsigned long long blocks;
+	bench_sem self;
+	bench_sem * next;
+};
+
+void ?{}( Partner & this ) {
+	this.count = this.blocks = 0;
+}
+
+thread BThrd {
+	Partner & partner;
+};
+
+void ?{}( BThrd & this, Partner * partner ) {
+	((thread&)this){ bench_cluster };
+	&this.partner = partner;
+}
+
+void ^?{}( BThrd & mutex this ) {}
+
+void main( BThrd & thrd ) with(thrd.partner) {
+	count = 0;
+	for() {
+		blocks += wait( self );
+		post( *next );
+		count ++;
+		if( clock_mode && stop) break;
+		if(!clock_mode && count >= stop_count) break;
+	}
+
+	__atomic_fetch_add(&threads_left, -1, __ATOMIC_SEQ_CST);
+}
+
+int main(int argc, char * argv[]) {
+	unsigned ring_size = 2;
+	cfa_option opt[] = {
+		BENCH_OPT,
+		{ 'r', "ringsize", "Number of threads in a cycle", ring_size }
+	};
+	BENCH_OPT_PARSE("cforall cycle benchmark");
+
+	{
+		unsigned long long global_counter = 0;
+		unsigned long long global_blocks  = 0;
+		unsigned tthreads = nthreads * ring_size;
+		Time start, end;
+		BenchCluster bc = { nprocs };
+		{
+			threads_left = tthreads;
+			BThrd **  threads = alloc(tthreads);
+			Partner * thddata = alloc(tthreads);
+			for(i; tthreads) {
+				(thddata[i]){};
+				unsigned pi = (i + nthreads) % tthreads;
+				thddata[i].next = &thddata[pi].self;
+			}
+			for(int i = 0; i < tthreads; i++) {
+				threads[i] = malloc();
+				(*threads[i]){ &thddata[i] };
+			}
+			printf("Starting\n");
+
+			bool is_tty = isatty(STDOUT_FILENO);
+			start = timeHiRes();
+
+			for(i; nthreads) {
+				post( thddata[i].self );
+			}
+			wait(start, is_tty);
+
+			stop = true;
+			end = timeHiRes();
+			printf("\nDone\n");
+
+			for(i; tthreads) {
+				post( thddata[i].self );
+				Partner & partner = join( *threads[i] ).partner;
+				global_counter += partner.count;
+				global_blocks  += partner.blocks;
+				delete(threads[i]);
+			}
+			free(threads);
+			free(thddata);
+		}
+
+		printf("Duration (ms)        : %'lf\n", (end - start)`dms);
+		printf("Number of processors : %'d\n", nprocs);
+		printf("Number of threads    : %'d\n", tthreads);
+		printf("Cycle size (# thrds) : %'d\n", ring_size);
+		printf("Total Operations(ops): %'15llu\n", global_counter);
+		printf("Total blocks         : %'15llu\n", global_blocks);
+		printf("Ops per second       : %'18.2lf\n", ((double)global_counter) / (end - start)`ds);
+		printf("ns per ops           : %'18.2lf\n", (end - start)`dns / global_counter);
+		printf("Ops per threads      : %'15llu\n", global_counter / tthreads);
+		printf("Ops per procs        : %'15llu\n", global_counter / nprocs);
+		printf("Ops/sec/procs        : %'18.2lf\n", (((double)global_counter) / nprocs) / (end - start)`ds);
+		printf("ns per ops/procs     : %'18.2lf\n", (end - start)`dns / (global_counter / nprocs));
+		fflush(stdout);
+	}
+
+	return 0;
+}
